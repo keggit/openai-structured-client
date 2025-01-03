@@ -1,4 +1,6 @@
+use regex::Regex;
 use reqwest::Client;
+use schemars::schema::{RootSchema, Schema, SchemaObject};
 use schemars::schema_for;
 use schemars::JsonSchema;
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, SeqAccess, Visitor};
@@ -6,6 +8,7 @@ use serde::Deserialize;
 use serde_json;
 use serde_json::{json, Value};
 use std::any::type_name;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
@@ -41,39 +44,129 @@ impl OpenAiClient {
     }
 
     fn schema_name_for_type<T>() -> String {
-        // Get the full type name, e.g. "my_crate::Review"
         let full_type_name = type_name::<T>();
-        // Extract the last segment after "::"
-        let type_name = full_type_name.rsplit("::").next().unwrap_or(full_type_name);
-        // Convert to lowercase and append "_response"
-        // Adjust case formatting if desired.
-        format!("{}_response", type_name.to_lowercase())
+
+        // Replace anything not in [a-zA-Z0-9_-] with underscores.
+        let re = Regex::new("[^a-zA-Z0-9_-]+").unwrap();
+        let sanitized = re.replace_all(full_type_name, "_").to_string();
+
+        format!("{}_response", sanitized.to_lowercase())
     }
 
-    fn generate_schema<T: JsonSchema>() -> Result<Value, Box<dyn std::error::Error>> {
-        let schema = schema_for!(T);
-        let mut schema_value = serde_json::to_value(&schema.schema)?;
+    /// Generates a JSON schema for T, ensuring additionalProperties=false
+    /// for all nested object types.
+    fn generate_schema<T: JsonSchema>() -> Result<Value, Box<dyn Error>> {
+        Self::generate_schema_with_no_additional::<T>()
+    }
 
-        if let Value::Object(ref mut obj) = schema_value {
-            // Ensure additionalProperties is false
-            obj.insert("additionalProperties".to_string(), Value::Bool(false));
+    fn generate_schema_with_no_additional<T: JsonSchema>() -> Result<Value, Box<dyn Error>> {
+        let mut root_schema: RootSchema = schema_for!(T);
 
-            // Ensure all properties are required
-            if let Some(Value::Object(props)) = obj.get("properties") {
-                let all_keys: Vec<String> = props.keys().cloned().collect();
-                obj.insert(
-                    "required".to_string(),
-                    Value::Array(all_keys.into_iter().map(Value::String).collect()),
-                );
-            } else {
-                // If no properties found, just ensure required is an empty array
-                obj.insert("required".to_string(), Value::Array(vec![]));
+        // 1. Update the top-level schema
+        Self::set_no_additional_properties(&mut root_schema.schema);
+
+        // 2. Update each schema in "definitions"
+        for (_name, def_schema) in root_schema.definitions.iter_mut() {
+            if let Schema::Object(ref mut obj) = def_schema {
+                Self::set_no_additional_properties(obj);
             }
         }
 
+        // 3. Convert RootSchema => JSON
+        let schema_value = serde_json::to_value(&root_schema)?;
         Ok(schema_value)
     }
 
+    fn set_no_additional_properties(schema_obj: &mut SchemaObject) {
+        // 1. If this schema is "type: object", set additionalProperties = false
+        //    and force all properties to appear in the 'required' list.
+        if let Some(schemars::schema::SingleOrVec::Single(ref t)) = schema_obj.instance_type {
+            if **t == schemars::schema::InstanceType::Object {
+                // If there's no ObjectValidation yet, create one
+                let ov = schema_obj
+                    .object
+                    .get_or_insert_with(|| Box::new(schemars::schema::ObjectValidation::default()));
+
+                // Disallow unknown fields
+                ov.additional_properties = Some(Box::new(schemars::schema::Schema::Bool(false)));
+
+                let prop_names: BTreeSet<String> = ov.properties.keys().cloned().collect();
+                ov.required = prop_names;
+            }
+        }
+
+        // 2. Recurse into each property
+        if let Some(ref mut box_obj_validation) = schema_obj.object {
+            // Now that we have forced them to be required, also
+            // descend into each property’s schema if it's an object.
+            for (_prop_name, prop_schema) in box_obj_validation.properties.iter_mut() {
+                if let schemars::schema::Schema::Object(ref mut nested_obj) = prop_schema {
+                    Self::set_no_additional_properties(nested_obj);
+                }
+            }
+        }
+
+        // 3. If it's an array, handle items
+        if let Some(ref mut array_box) = schema_obj.array {
+            // array_box is Box<ArrayValidation>
+            if let Some(items_schema) = &mut array_box.items {
+                match items_schema {
+                    // single schema
+                    schemars::schema::SingleOrVec::Single(boxed_schema) => {
+                        if let schemars::schema::Schema::Object(ref mut nested_obj) = **boxed_schema
+                        {
+                            Self::set_no_additional_properties(nested_obj);
+                        }
+                    }
+                    // tuple variant
+                    schemars::schema::SingleOrVec::Vec(ref mut schemas) => {
+                        for schema in schemas.iter_mut() {
+                            if let schemars::schema::Schema::Object(ref mut nested_obj) = schema {
+                                Self::set_no_additional_properties(nested_obj);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Check "subschemas" (allOf, anyOf, oneOf, not)
+        if let Some(ref mut subs) = schema_obj.subschemas {
+            // allOf
+            if let Some(ref mut all_of_vec) = subs.all_of {
+                for sub_schema in all_of_vec.iter_mut() {
+                    if let schemars::schema::Schema::Object(ref mut nested_obj) = sub_schema {
+                        Self::set_no_additional_properties(nested_obj);
+                    }
+                }
+            }
+            // anyOf
+            if let Some(ref mut any_of_vec) = subs.any_of {
+                for sub_schema in any_of_vec.iter_mut() {
+                    if let schemars::schema::Schema::Object(ref mut nested_obj) = sub_schema {
+                        Self::set_no_additional_properties(nested_obj);
+                    }
+                }
+            }
+            // oneOf
+            if let Some(ref mut one_of_vec) = subs.one_of {
+                for sub_schema in one_of_vec.iter_mut() {
+                    if let schemars::schema::Schema::Object(ref mut nested_obj) = sub_schema {
+                        Self::set_no_additional_properties(nested_obj);
+                    }
+                }
+            }
+            // not
+            if let Some(ref mut not_box) = subs.not {
+                if let schemars::schema::Schema::Object(ref mut nested_obj) = **not_box {
+                    Self::set_no_additional_properties(nested_obj);
+                }
+            }
+        }
+    }
+
+    /// Calls the OpenAI endpoint, passing the JSON schema in 'response_format.json_schema.schema'.
+    /// Expects a typed response conforming to T.
     pub async fn call_schema<T: DeserializeOwned + JsonSchema + Clone>(
         &self,
         user_prompt: &str,
@@ -94,6 +187,7 @@ impl OpenAiClient {
             "content": user_prompt
         }));
 
+        // Build the request body
         let body = json!({
             "model": self.model,
             "messages": messages,

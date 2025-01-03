@@ -14,8 +14,8 @@ async fn main() {
     let openai = OpenAiClient::new(http_client, endpoint, model, api_key)
         .with_system_role("You are a helpful English tutor.");
 
-    let prompt = "Explain the errors in the following sentences... yada yada";
-    let review: Review = openai
+    let prompt = "Explain the errors in the following sentences... Sentence 1: This is a penn. Sentence 2: This tomato has green.";
+    let review: Reviews = openai
         .call_schema(prompt)
         .await
         .expect("openai responded and parsed into Review");
@@ -28,4 +28,9 @@ pub struct Review {
     pub explanation: String,
     pub incorrect_words: Option<Vec<String>>,
     pub incorrect_grammars: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
+pub struct Reviews {
+    pub reviews: Vec<Review>,
 }
